@@ -81,8 +81,8 @@ class VKClient:
                 cyrillic_detected.append(raw)
                 continue
 
-            # Очистка от любых вариантов ссылок: https://vk.com/, http://vk.com/, vk.com/, m.vk.com/
-            clean = re.sub(r"^(https?://)?(m\.)?vk\.com/", "", raw, flags=re.IGNORECASE)
+            # Очистка от любых вариантов ссылок: vk.com, vk.ru, m.vk.com, www.vk.com и т.д.
+            clean = re.sub(r"^(https?://)?(m\.|www\.)?vk\.(com|ru)/", "", raw, flags=re.IGNORECASE)
             # Отсекаем параметры запросов (?all=1...) и якоря (#...)
             clean = clean.split("?")[0].split("#")[0]
             clean = clean.replace("@", "").strip("/").strip()
@@ -374,72 +374,256 @@ def export_results(df: pd.DataFrame, G: nx.Graph, output_prefix: str = "centrali
         logger.warning(f"Не удалось экспортировать .gexf: {e}")
 
 
-def visualize_network(G: nx.Graph, group_ids: Set[int], output_image: str = "vk_graph_plot.png"):
+def visualize_network(
+    G: nx.Graph,
+    group_ids: Set[int],
+    output_image: str = "vk_graph_plot.png",
+    render_all: bool = True,
+    max_friends_per_student: int = 35,
+    max_fof_per_friend: int = 5
+):
     """
-    Отрисовывает граф, выделяя членов группы ярким цветом и увеличенным размером,
-    аналогично иллюстрации на лекционном слайде.
+    Создает визуализацию сети с поддержкой 100% охвата всех узлов (все 4800+ человек).
+    Использует 4-уровневую палитру:
+      🔴 Красный: Одногруппники
+      🟢 Зеленый: Общие друзья (мосты между 2+ студентами)
+      🟡 Желтый: Личные друзья (1-й круг)
+      🔵 Светло-голубой: Друзья друзей (2-й круг)
     """
-    logger.info(f"Построение визуализации графа ({G.number_of_nodes()} узлов)...")
-    plt.figure(figsize=(14, 14), dpi=300)
+    import math
+    import matplotlib.patheffects as path_effects
+    from matplotlib.lines import Line2D
 
-    # Используем алгоритм пружинного размещения (Spring Layout)
-    pos = nx.spring_layout(G, k=0.15, iterations=40, seed=42)
+    total_graph_nodes = G.number_of_nodes()
+    logger.info(f"Подготовка визуализации графа (всего в сети: {total_graph_nodes} узлов)...")
 
-    # Разделяем узлы на группу и остальных
     group_nodes = [n for n in G.nodes() if n in group_ids]
-    other_nodes = [n for n in G.nodes() if n not in group_ids]
 
-    # 1. Фоновые узлы (друзья / друзья друзей)
-    nx.draw_networkx_nodes(
-        G, pos,
-        nodelist=other_nodes,
-        node_size=25,
-        node_color="#64B5F6",
-        alpha=0.45,
-        label="Друзья и связи"
-    )
+    # Сбор прямых друзей для каждого студента
+    student_friends_map: Dict[int, Set[int]] = {}
+    direct_friends_all: Set[int] = set()
+    for s in group_nodes:
+        s_friends = set(G.neighbors(s)) - group_ids
+        student_friends_map[s] = s_friends
+        direct_friends_all.update(s_friends)
 
-    # 2. Узлы членов группы
+    # 1. Общие друзья (связывают 2+ студентов)
+    shared_friends_all = {
+        f for f in direct_friends_all
+        if sum(1 for s in group_nodes if f in student_friends_map[s]) >= 2
+    }
+
+    # 2. Личные друзья студентов (1-й круг)
+    solo_friends_all = direct_friends_all - shared_friends_all
+
+    # 3. Друзья друзей (2-й круг) — абсолютно все оставшиеся узлы сети
+    fof_all = set(G.nodes()) - set(group_nodes) - direct_friends_all
+
+    if render_all:
+        # Режим полного отображения: берем абсолютно ВСЕ узлы сети без отсева
+        selected_solo = solo_friends_all
+        selected_fof = fof_all
+        H = G.copy()
+        logger.info(
+            f"Полный режим: отображаем ВСЕ {H.number_of_nodes()} узлов "
+            f"({len(group_nodes)} членов группы, {len(shared_friends_all)} общих, "
+            f"{len(selected_solo)} прямых друзей, {len(selected_fof)} друзей друзей)."
+        )
+    else:
+        # Сжатый режим выборки (для компактного превью)
+        selected_solo = set()
+        for s in group_nodes:
+            s_solo = [n for n in G.neighbors(s) if n in solo_friends_all]
+            s_solo_sorted = sorted(s_solo, key=lambda x: G.degree(x), reverse=True)
+            selected_solo.update(s_solo_sorted[:max_friends_per_student])
+
+        selected_fof = set()
+        for f in (shared_friends_all | selected_solo):
+            fof_cands = [n for n in G.neighbors(f) if n in fof_all]
+            fof_sorted = sorted(fof_cands, key=lambda x: G.degree(x), reverse=True)
+            selected_fof.update(fof_sorted[:max_fof_per_friend])
+
+        keep_nodes = set(group_nodes) | shared_friends_all | selected_solo | selected_fof
+        H = G.subgraph(keep_nodes).copy()
+
+    logger.info("Расчет укладки графа пружинным алгоритмом (15-20 сек)...")
+    k_optimal = 1.6 / (H.number_of_nodes() ** 0.46)
+    pos = nx.spring_layout(H, k=k_optimal, iterations=38, seed=42)
+
+    fig, ax = plt.subplots(figsize=(24, 24), dpi=300)
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#FAFAFA")
+
+    fof_edges = []
+    direct_edges = []
+    core_edges = []
+
+    group_ids_set = set(group_ids)
+    for u, v in H.edges():
+        if u in selected_fof or v in selected_fof:
+            fof_edges.append((u, v))
+        elif (u in group_ids_set and v in shared_friends_all) or \
+             (v in group_ids_set and u in shared_friends_all) or \
+             (u in group_ids_set and v in group_ids_set):
+            core_edges.append((u, v))
+        else:
+            direct_edges.append((u, v))
+
+    # Слой 1: Ультратонкие ребра друзей друзей (фоновая паутина)
+    if fof_edges:
+        nx.draw_networkx_edges(
+            H, pos,
+            edgelist=fof_edges,
+            ax=ax,
+            alpha=0.04 if render_all else 0.18,
+            edge_color="#38BDF8",
+            width=0.25 if render_all else 0.7
+        )
+
+    # Слой 2: Ребра прямых друзей
+    if direct_edges:
+        nx.draw_networkx_edges(
+            H, pos,
+            edgelist=direct_edges,
+            ax=ax,
+            alpha=0.22 if render_all else 0.35,
+            edge_color="#94A3B8",
+            width=0.6 if render_all else 1.0
+        )
+
+    # Слой 3: Акцентные ребра между студентами и их мостами
+    if core_edges:
+        nx.draw_networkx_edges(
+            H, pos,
+            edgelist=core_edges,
+            ax=ax,
+            alpha=0.85,
+            edge_color="#0F172A",
+            width=1.8
+        )
+
+    # Уровень 4: Светло-голубые (Друзья друзей — все 4000+ узлов микро-точками)
+    if selected_fof:
+        nx.draw_networkx_nodes(
+            H, pos,
+            nodelist=list(selected_fof),
+            node_size=6 if render_all else 32,
+            node_color="#38BDF8",
+            alpha=0.40 if render_all else 0.70,
+            ax=ax
+        )
+
+    # Уровень 3: Желтые (Личные друзья студентов)
+    if selected_solo:
+        nx.draw_networkx_nodes(
+            H, pos,
+            nodelist=list(selected_solo),
+            node_size=24 if render_all else 75,
+            node_color="#FACC15",
+            edgecolors="#FFFFFF",
+            linewidths=0.5 if render_all else 0.9,
+            alpha=0.85,
+            ax=ax
+        )
+
+    # Уровень 2: Зеленые (Общие друзья / мосты)
+    if shared_friends_all:
+        nx.draw_networkx_nodes(
+            H, pos,
+            nodelist=list(shared_friends_all),
+            node_size=180,
+            node_color="#22C55E",
+            edgecolors="#FFFFFF",
+            linewidths=1.8,
+            alpha=0.98,
+            ax=ax
+        )
+
+    # Уровень 1: Красные (Члены группы — максимальный масштаб)
+    degrees = dict(G.degree())
+    student_sizes = [max(1200, min(degrees.get(uid, 50) * 8, 2800)) for uid in group_nodes]
+
     nx.draw_networkx_nodes(
-        G, pos,
+        H, pos,
         nodelist=group_nodes,
-        node_size=280,
-        node_color="#E53935",
+        node_size=student_sizes,
+        node_color="#EF4444",
         edgecolors="#FFFFFF",
-        linewidths=1.5,
-        label="Одногруппники"
+        linewidths=3.5,
+        alpha=1.0,
+        ax=ax
     )
 
-    # 3. Ребра сети
-    nx.draw_networkx_edges(
-        G, pos,
-        alpha=0.12,
-        edge_color="#78909C",
-        width=0.6
-    )
-
-    # 4. Подписи только для членов группы
     labels = {}
-    for n in group_nodes:
-        name = G.nodes[n].get("label") or f"id{n}"
-        labels[n] = name.split()[0] if " " in name else name
+    for uid in group_nodes:
+        full_label = G.nodes[uid].get("label") or f"id{uid}"
+        parts = full_label.split()
+        labels[uid] = f"{parts[0]}\n{parts[1][:1]}." if len(parts) >= 2 else full_label
 
-    nx.draw_networkx_labels(
-        G, pos,
+    text_items = nx.draw_networkx_labels(
+        H, pos,
         labels=labels,
-        font_size=8,
+        font_size=11,
         font_family="sans-serif",
         font_weight="bold",
-        font_color="#212121"
+        font_color="#0F172A",
+        ax=ax
     )
 
-    plt.title("Социальный граф группы VK: друзья и друзья друзей", fontsize=16, pad=20, fontweight="bold")
-    plt.axis("off")
-    plt.legend(scatterpoints=1, loc="upper right", frameon=True, fontsize=11)
+    for text_obj in text_items.values():
+        text_obj.set_path_effects([
+            path_effects.Stroke(linewidth=4.0, foreground="white"),
+            path_effects.Normal()
+        ])
+
+    plt.title(
+        f"Полная социальная сеть группы VK ({H.number_of_nodes()} узлов): 100% окружение 1-го и 2-го круга",
+        fontsize=17,
+        fontweight="bold",
+        pad=22,
+        color="#0F172A"
+    )
+
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', label=f'Одногруппники ({len(group_nodes)})',
+               markerfacecolor='#EF4444', markersize=14, markeredgecolor='#FFFFFF', markeredgewidth=1.5),
+        Line2D([0], [0], marker='o', color='w', label=f'Общие друзья / мосты ({len(shared_friends_all)})',
+               markerfacecolor='#22C55E', markersize=10, markeredgecolor='#FFFFFF', markeredgewidth=1.2),
+        Line2D([0], [0], marker='o', color='w', label=f'Личные друзья 1-го круга ({len(selected_solo)})',
+               markerfacecolor='#FACC15', markersize=8, markeredgecolor='#FFFFFF', markeredgewidth=0.8),
+        Line2D([0], [0], marker='o', color='w', label=f'Друзья друзей 2-го круга ({len(selected_fof)})',
+               markerfacecolor='#38BDF8', markersize=6, alpha=0.85, markeredgecolor='none'),
+    ]
+
+    ax.legend(
+        handles=legend_elements,
+        loc="upper right",
+        frameon=True,
+        facecolor="white",
+        edgecolor="#CBD5E1",
+        fontsize=11,
+        borderpad=0.9,
+        labelspacing=0.8
+    )
+
+    ax.text(
+        0.02, 0.02,
+        f"• Всего узлов в сети: {H.number_of_nodes()} | Ребер: {H.number_of_edges()}\n"
+        "• Красные: члены группы (размер узла пропорционален степени влияния)\n"
+        "• Зеленые: общие друзья (коммуникационные мосты между студентами)\n"
+        "• Желтые: прямые друзья членов группы (1-й круг)\n"
+        "• Светло-голубые: окружение связей (друзья друзей 2-го круга)",
+        transform=ax.transAxes,
+        fontsize=10.5,
+        verticalalignment="bottom",
+        bbox=dict(boxstyle="round,pad=0.6", facecolor="white", edgecolor="#CBD5E1", alpha=0.94)
+    )
+
+    ax.axis("off")
     plt.tight_layout()
-    plt.savefig(output_image, bbox_inches="tight")
+    plt.savefig(output_image, bbox_inches="tight", dpi=300)
     plt.close()
-    logger.info(f"Изображение графа успешно сохранено: {output_image}")
+    logger.info(f"Итоговая визуализация с {H.number_of_nodes()} узлами сохранена в: {output_image}")
 
 
 def main():
@@ -467,6 +651,11 @@ def main():
         "--no-fof",
         action="store_true",
         help="Отключить сбор друзей друзей (быстрый режим: только 1-й круг)"
+    )
+    parser.add_argument(
+        "--sample-only",
+        action="store_true",
+        help="Отрисовать только сжатую выборку узлов вместо всех 4800+"
     )
 
     args = parser.parse_args()
@@ -510,7 +699,12 @@ def main():
 
     # Экспорт результатов
     export_results(df_metrics, G, output_prefix="centrality_report")
-    visualize_network(G, group_ids_set, output_image="vk_graph_plot.png")
+    visualize_network(
+        G,
+        group_ids_set,
+        output_image="vk_graph_plot.png",
+        render_all=(not args.sample_only)
+    )
 
     print("[✔] Выполнение успешно завершено!")
     print("    - Таблица метрик: centrality_report.xlsx и centrality_report.csv")
